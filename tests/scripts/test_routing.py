@@ -154,11 +154,11 @@ def test_fresh_haiku_when_none_idle_eligible(tmp_path):
 
 
 def test_limits_retire_a_haiku_agent(tmp_path):
-    worn = {"id": "w", "tier": "haiku", "tasks": ["a", "b", "c", "d", "e", "f"]}  # max_tasks 6
+    worn = {"id": "w", "tier": "haiku", "tasks": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q", "r", "s", "t"]}  # max_tasks 20
     big = {"id": "b", "tier": "haiku", "tasks": ["a"], "context_k": 59}  # + task context over max_context_k 60
     d, err = dispatch(tmp_path, mech_plan(tmp_path, 1), [worn, big])
     assert d["T1"].startswith("fresh tier=haiku")
-    assert "evict=w 6 tasks done" in err and "evict=b context over 60k" in err
+    assert "evict=w 20 tasks done" in err and "evict=b context over 60k" in err
 
 
 def test_choice_among_idle_haiku_agents_is_deterministic(tmp_path):
@@ -175,7 +175,7 @@ def test_choice_among_idle_haiku_agents_is_deterministic(tmp_path):
 
 def test_three_ready_one_idle_agent_takes_one_and_two_start_fresh(tmp_path):
     h = {"id": "t0", "tier": "haiku", "tasks": ["T0"]}
-    d, _ = dispatch(tmp_path, mech_plan(tmp_path, 3), [h])
+    d, _ = dispatch(tmp_path, mech_plan(tmp_path, 3), [h], "--batch", "1")
     h_lines = sorted(v.split(" tier")[0] for v in haiku_lines(d).values())
     assert h_lines == ["agent=t0", "fresh", "fresh"]
 
@@ -208,7 +208,7 @@ def test_mini_prime_is_small_and_hash_stable(tmp_path):
     out_h = tmp_path / "h.md"
     runs = [run(BUILD_PRIME, "--plan", p, "--tier", "haiku", "--out", out_h, cwd=tmp_path).out.split() for _ in range(2)]
     assert runs[0] == runs[1] and runs[0][0] == hashlib.sha256(out_h.read_bytes()).hexdigest()
-    full = run(BUILD_PRIME, "--plan", p, "--spec", spec, "--sections", "1", "--out", tmp_path / "f.md", cwd=tmp_path).out.split()
+    full = run(BUILD_PRIME, "--plan", p, "--spec", spec, "--sections", "1", "--prime", "full", "--out", tmp_path / "f.md", cwd=tmp_path).out.split()
     assert int(runs[0][1]) < int(full[1]) / 2
     text = out_h.read_text(encoding="utf-8")
     assert text.startswith("# superlite prime (mini)") and "## Stub spec" in text and "stdlib only" in text
@@ -232,14 +232,14 @@ def test_min_first_time_pass_band_below_minimum_stays_on_sonnet(tmp_path):
 
 def test_kind_miss_logs_incident_and_task_never_returns_to_haiku(tmp_path):
     p = mech_plan(tmp_path, 2)
-    d, _ = dispatch(tmp_path, p, [])
+    d, _ = dispatch(tmp_path, p, [], "--batch", "1")
     assert "tier=haiku" in d["T1"] or "tier=haiku" in d["T2"]
     cp = run(ROUTING, "miss", "--task", "T1", "--plan", p, cwd=tmp_path)
     assert cp.returncode == 0, cp.both
     assert cp.out.startswith("T1 kind-miss -> fixer-sonnet note=.superlite/fixes/F-T1-1.md tier=sonnet")
     log = (tmp_path / ".superlite" / "incidents.jsonl").read_text(encoding="utf-8")
     assert "kind-miss T1" in log
-    d, _ = dispatch(tmp_path, p, [])
+    d, _ = dispatch(tmp_path, p, [], "--batch", "1")
     assert d["T1"].startswith("fresh tier=sonnet")  # never retried on haiku
     assert "tier=haiku" in d["T2"]
 
