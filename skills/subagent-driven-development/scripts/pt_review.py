@@ -80,6 +80,8 @@ NAME_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*")  # leading dotted ident
 NAME_END_RE = re.compile(r"$|[(:<]| ->")  # what may follow an unquoted symbol name; anything else is prose | O(1)
 SIG_END_RE = re.compile(r"\s*(?:[(<]|:(?!//)(?=\s*\S)|->)")  # what follows a name in a signature: `(`, `<`, `: Type` or `->`; not a URL or a lone `label:` | O(1)
 DECL_END_RE = re.compile(r"\s*(?:$|[=,{])")  # what may follow a keyword-declared name: the end, `= value`, `{` | O(1)
+CALL_RE = re.compile(r"\s*\(\s*(?:[A-Za-z_]\w*\s*:\s*)*\)\s*")  # a call's tail, nothing typed: `()`, `(for:in:)` | O(1)
+LIST_GLUE_RE = re.compile(r"[,;&]|\b(?:and|or)\b")  # what joins the spans of a leading list | O(1)
 CASE_ITEM_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\(.*\))?\s*(?:=.*)?")  # one element of a `case` list: `a`, `b(Int)`, `c = 1` | O(1)
 DECL_PREFIX_RE = re.compile(r"(?:(?:public|private|internal|fileprivate|open|final|static|export|default|async|abstract|override|mutating|indirect|lazy|convenience|required"  # O(1)
                             r"|struct|class|enum|actor|protocol|typealias|extension|interface|trait|func|fn|def|fun|function|type|let|var|const|case|record|mod)\s+)+")  # leading modifiers and declaration keywords | O(1)
@@ -331,15 +333,31 @@ def _span_names(s: str, quoted: bool) -> list[str]:  # O(m) total
     return [m.group(0)] if ok else []  # O(1)
 
 
+def _is_use(span: str, before: str) -> bool:  # O(m) total
+    """A backticked call (`NSHomeDirectory()`, `urls(for:in:)`: empty parens or bare labels, nothing typed after) that
+    prose precedes uses a name, it does not declare one (#102); `before` is the item text ahead of the span."""
+    s = span.strip()  # O(m)
+    m = NAME_RE.match(s)  # O(m)
+    if not m or not CALL_RE.fullmatch(s, m.end()):  # O(m)
+        return False  # O(1)
+    before = re.sub(r"`[^`]*`", " ", before).strip()  # earlier spans are list members | O(m)
+    lead = NAME_RE.match(before)  # an unquoted call leading the item (`Foo.bar() and `Baz()``) is one too | O(m)
+    tail = lead and CALL_RE.match(before, lead.end())  # O(m)
+    return bool(LIST_GLUE_RE.sub(" ", before[tail.end():] if tail else before).strip())  # O(m)
+
+
 def symbol_names(item: str) -> list[str]:  # O(m) total
     """The symbol names a Produces item declares, signatures only (#78): a name counts when `(`, `<`, `: Type` or `->`
     follows it, or a declaration keyword precedes it (`struct Foo`, `func make`); a `case a, b(Int), c = 1` list
-    gives every case. A bare name (`xcodebuild`, `NSHomeDirectory`, `Foo.bar`) is prose. Backticked spans win; when
-    none names a symbol the unquoted item is read, where a keyword-led name must look like a symbol (capitalised, or
-    followed by `(` or `:`) so `class hierarchy` stays prose."""
+    gives every case. A bare name (`xcodebuild`, `NSHomeDirectory`, `Foo.bar`) is prose. The unquoted item's leading
+    name is read next to the backticked spans; there a keyword-led name must look like a symbol (capitalised, or
+    followed by `(` or `:`) so `class hierarchy` stays prose. A backticked call with nothing typed (`NSHomeDirectory()`,
+    `urls(for:in:)`) declares only in the item's leading list of spans; after prose it is a use (#102)."""
     text = item.strip()  # O(m)
-    spans = re.findall(r"`([^`]*)`", text)  # O(m)
-    cands = [n for sp in spans for n in _span_names(sp, True)] or _span_names(text, False)  # O(m)
+    cands = _span_names(text, False)  # O(m)
+    for sp in re.finditer(r"`([^`]*)`", text):  # O(s) iterations
+        if not _is_use(sp.group(1), text[:sp.start()]):  # O(m)
+            cands += _span_names(sp.group(1), True)  # O(m)
     out: list[str] = []  # O(1)
     for name in cands:  # O(c) iterations
         if "." in name and name.rsplit(".", 1)[1].lower() in FILE_SUFFIXES:  # a file name, not a symbol | O(len(name))
@@ -1629,14 +1647,31 @@ def cross_package_calls(root: Path) -> list[str]:  # O(S*B) total, reads+parses 
     return [f"- {f}:{ln}  {a} -> {b}: {full}()" for f, ln, a, b, full in sorted(rows)]  # O(R log R) sort of rows
 
 
-def diff_head(root: Path) -> str | None:  # O(file size) total
-    """Sha of the newest checkpoint entry, or None without checkpoints."""  # O(1)
+def _state_sha(root: Path, pick) -> str | None:  # O(file size) total
+    """`pick(checkpoints.json)` when it is a hex id (never an option or None), else None."""  # O(1)
     try:  # O(1)
-        entries = json.loads((root / autocommit.STATE).read_text(encoding="utf-8")).get("entries") or []  # O(file size)
-        sha = entries[-1]["sha"]  # O(1)
-        return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{1,64}", sha) else None  # a hex id only: never an option or None | O(1)
+        sha = pick(json.loads((root / autocommit.STATE).read_text(encoding="utf-8")))  # O(file size)
+        return sha if isinstance(sha, str) and re.fullmatch(r"[0-9a-fA-F]{1,64}", sha) else None  # O(1)
     except (OSError, ValueError, AttributeError, IndexError, KeyError, TypeError):  # O(1)
         return None  # O(1)
+
+
+def diff_head(root: Path) -> str | None:  # O(file size) total
+    """Sha of the newest checkpoint entry, or None without checkpoints."""  # O(1)
+    return _state_sha(root, lambda st: (st.get("entries") or [])[-1]["sha"])  # O(file size)
+
+
+def moved_files(root: Path) -> set[str]:  # O(F) + 1 git subprocess
+    """Files HEAD changed since the run started (checkpoints.json `head`), as a mid-run fast-forward does (#104)."""
+    start = _state_sha(root, lambda st: st.get("head"))  # O(file size)
+    if not start:  # O(1)
+        return set()  # O(1)
+    try:  # O(1)
+        r = subprocess.run(["git", "-C", str(root), "diff", "--name-only", start, "HEAD"],  # O(F) + git spawn
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)  # O(1)
+    except (OSError, subprocess.TimeoutExpired):  # O(1)
+        return set()  # O(1)
+    return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()} if r.returncode == 0 else set()  # O(F)
 
 
 def diff_range(root: Path, base: str) -> list[str]:  # O(file size) total
@@ -1690,7 +1725,10 @@ def _excerpt_order(changed: list[str], hot: list[str]) -> list[str]:  # O(F^2) t
 
 
 def changed_diffs(root: Path, base: str | None, files: list[str]) -> tuple[list[str], list[tuple[str, list[str]]]] | None:  # O(X) + one git spawn per changed file
-    """(changed files, [(file, diff lines)] in excerpt order) against base and the newest checkpoint; None outside git."""
+    """(changed files, [(file, diff lines)] in excerpt order) against base and the newest checkpoint; None outside git.
+
+    A checkpointed file that HEAD also changed since the run started holds the merged lines too (a checkpoint stores
+    the working-tree file), so its hunk diffs HEAD against the checkpoint: only the run's lines (#104)."""
     if not (root / ".git").exists():  # O(1)
         return None  # O(1)
     if base is None:  # O(1)
@@ -1699,6 +1737,8 @@ def changed_diffs(root: Path, base: str | None, files: list[str]) -> tuple[list[
         roots = first.stdout.split() if first.returncode == 0 else []  # O(1)
         base = roots[0] if roots else "HEAD"  # O(1)
     rng = diff_range(root, base)  # O(file size)
+    cp = diff_head(root)  # O(file size)
+    moved = moved_files(root) if cp else set()  # O(F) + git spawn
     changed: list[str] = []  # O(1)
     try:  # O(1)
         nm = subprocess.run(["git", "-C", str(root), "diff", "--name-only", *rng],  # O(X) + git spawn
@@ -1710,7 +1750,7 @@ def changed_diffs(root: Path, base: str | None, files: list[str]) -> tuple[list[
     diffs: list[tuple[str, list[str]]] = []  # O(1)
     for f in _excerpt_order(changed, files):  # O(F) iterations
         try:  # O(1)
-            r = subprocess.run(["git", "-C", str(root), "diff", "-U3", *rng, "--", f],  # O(X) + git spawn
+            r = subprocess.run(["git", "-C", str(root), "diff", "-U3", *(["HEAD", cp] if f in moved else rng), "--", f],  # O(X) + git spawn
                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)  # O(1)
         except (OSError, subprocess.TimeoutExpired):  # O(1)
             continue  # O(1)
