@@ -1670,11 +1670,11 @@ def moved_files(root: Path) -> set[str]:  # O(F) + 1 git subprocess
     if not start:  # O(1)
         return set()  # O(1)
     try:  # O(1)
-        r = subprocess.run(["git", "-C", str(root), "diff", "--name-only", start, "HEAD"],  # O(F) + git spawn
+        r = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "-z", start, "HEAD"],  # O(F) + git spawn
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)  # O(1)
     except (OSError, subprocess.TimeoutExpired):  # O(1)
         return set()  # O(1)
-    return {ln.strip() for ln in r.stdout.splitlines() if ln.strip()} if r.returncode == 0 else set()  # O(F)
+    return {ln for ln in r.stdout.split("\0") if ln} if r.returncode == 0 else set()  # -z: git quotes no path | O(F)
 
 
 def diff_range(root: Path, base: str) -> list[str]:  # O(file size) total
@@ -1701,7 +1701,7 @@ class RunRanges:  # O(1)
         return ["HEAD", self.cp] if self.cp and f in self.moved else self.rng  # O(1)
 
 
-def run_ranges(root: Path, base: str | None) -> RunRanges | None:  # O(F + file size) + up to 2 git spawns total
+def run_ranges(root: Path, base: str | None) -> RunRanges | None:  # O(F + file size) + up to 4 git spawns total
     """RunRanges for base (None: the root commit), or None outside git."""  # O(1)
     if not (root / ".git").exists():  # O(1)
         return None  # O(1)
@@ -1714,7 +1714,34 @@ def run_ranges(root: Path, base: str | None) -> RunRanges | None:  # O(F + file 
             roots = []  # O(1)
         base = roots[0] if roots else "HEAD"  # O(1)
     cp = diff_head(root)  # O(file size)
-    return RunRanges(_run_range(base, cp), cp, frozenset(moved_files(root)) if cp else frozenset())  # O(F) + git spawn
+    return RunRanges(_run_range(base, cp), cp, _head_side(root, base, cp, moved_files(root)))  # O(F) + 3 git spawns
+
+
+def _churn(root: Path, args: list[str], files: set[str]) -> dict[str, int]:  # O(F) + 1 git spawn
+    """{path: added + deleted lines} of `git diff args` over files; a path git reports otherwise is missing."""  # O(1)
+    try:  # O(1)
+        r = subprocess.run(["git", "-C", str(root), "diff", "--numstat", "--no-renames", "-z", *args, "--", *sorted(files)],  # O(F) + git spawn
+                           capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)  # O(1)
+    except (OSError, subprocess.TimeoutExpired):  # O(1)
+        return {}  # O(1)
+    out: dict[str, int] = {}  # O(1)
+    for ln in r.stdout.split("\0") if r.returncode == 0 else []:  # one record per path, no quoting | O(F) iterations
+        a, _, rest = ln.lstrip("\n").partition("\t")  # O(len)
+        d, _, path = rest.partition("\t")  # O(len)
+        if path:  # O(1)
+            out[path] = (int(a) + int(d)) if a.isdigit() and d.isdigit() else 1 << 30  # binary: never the smaller side | O(1)
+    return out  # O(1)
+
+
+def _head_side(root: Path, base: str, cp: str | None, moved: set[str]) -> frozenset[str]:  # O(F) + 2 git spawns
+    """Moved files whose run lines show best as HEAD against the checkpoint (#104); the others keep the run range (#158).
+
+    A file checkpointed after the fast-forward holds the merged lines, so HEAD..cp is the run's lines alone and
+    base...cp adds the merged ones; a file checkpointed before it is the other way round. The smaller diff wins."""
+    if not cp or not moved:  # O(1)
+        return frozenset(moved)  # O(1)
+    ahead, run = _churn(root, ["HEAD", cp], moved), _churn(root, [f"{base}...{cp}"], moved)  # O(F) + 2 git spawns
+    return frozenset(f for f in moved if f not in run or ahead.get(f, 1 << 30) <= run[f])  # O(F)
 
 
 STAT_BAR = 50  # O(1) widest +/- bar of one diff stat row
@@ -1828,7 +1855,6 @@ def git_diff_stat(root: Path, base: str | None, ranges: RunRanges | None = None,
 
 
 EXCERPT_FILE_LINES = 120  # O(1) cap on diff lines per hot-spot file
-EXCERPT_HOOK_LINES = 400  # O(1) cap on diff lines per changed hook file
 EXCERPT_FLOOR_LINES = 40  # O(1) diff lines every changed code file gets before any file gets more (#80)
 DEFAULT_TOKENS = 20000  # O(1) packet size without --max-tokens before the excerpts scale (plan section 5)
 AUTO_MAX_TOKENS = 60000  # O(1) ceiling of the scaled default (#80)
@@ -1860,12 +1886,12 @@ def changed_diffs(root: Path, base: str | None, files: list[str], ranges: RunRan
         return None  # O(1)
     changed: list[str] = []  # O(1)
     try:  # O(1)
-        nm = subprocess.run(["git", "-C", str(root), "diff", "--name-only", *rr.rng],  # O(X) + git spawn
+        nm = subprocess.run(["git", "-C", str(root), "diff", "--name-only", "-z", *rr.rng],  # O(X) + git spawn
                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)  # O(1)
-        changed = nm.stdout.split("\n") if nm.returncode == 0 else []  # O(X)
+        changed = nm.stdout.split("\0") if nm.returncode == 0 else []  # -z: git quotes no path | O(X)
     except (OSError, subprocess.TimeoutExpired):  # O(1)
         pass  # O(1)
-    changed = [c.strip() for c in changed if c.strip()]  # O(F)
+    changed = [c for c in changed if c]  # O(F)
     fresh = [f for f in extra if f not in changed]  # untracked files of an inline build, as added hunks (#130) | O(E*F)
     changed += fresh  # O(E)
     diffs: list[tuple[str, list[str]]] = []  # O(1)
@@ -1886,19 +1912,19 @@ def changed_diffs(root: Path, base: str | None, files: list[str], ranges: RunRan
     return changed, diffs  # O(1)
 
 
-def _file_cap(f: str, per_file: int) -> int:  # O(m) total
-    return EXCERPT_HOOK_LINES if _is_hook(f) else per_file  # O(m)
+def _file_cap(f: str, per_file: int, n_lines: int) -> int:  # O(m) total
+    return n_lines if _is_hook(f) else per_file  # hooks are uncapped, the token budget limits them | O(m)
 
 
 def _overhead(f: str, n_lines: int, per_file: int) -> int:  # O(m) total
     """Chars a shown file costs besides its diff lines: heading, fences, joins and the longest truncation note."""
-    note = f"(truncated: {_file_cap(f, per_file)} of {n_lines} diff lines shown, per-file cap)"  # O(m)
+    note = f"(truncated: {_file_cap(f, per_file, n_lines)} of {n_lines} diff lines shown, per-file cap)"  # O(m)
     return len(f"### {f}\n```diff\n") + len("\n```") + len(note) + 2  # O(m)
 
 
 def excerpt_need(diffs: list[tuple[str, list[str]]], per_file: int = EXCERPT_FILE_LINES) -> int:  # O(X) total
     """Chars the excerpt section takes when every changed file shows its hunks up to its per-file cap."""
-    return sum(_overhead(f, len(lines), per_file) + sum(len(ln) + 1 for ln in lines[:_file_cap(f, per_file)])  # O(X)
+    return sum(_overhead(f, len(lines), per_file) + sum(len(ln) + 1 for ln in lines[:_file_cap(f, per_file, len(lines))])  # O(X)
                for f, lines in diffs)  # O(F)
 
 
@@ -1919,9 +1945,9 @@ def _allocate(diffs: list[tuple[str, list[str]]], per_file: int, budget: int | N
 
     for f, lines in diffs:  # pass 1: the floor | O(F) iterations
         if f in first:  # O(1)
-            grow(f, lines, min(floor, _file_cap(f, per_file), len(lines)))  # O(floor)
+            grow(f, lines, min(floor, _file_cap(f, per_file, len(lines)), len(lines)))  # O(floor)
     for f, lines in diffs:  # pass 2: fill up to the per-file cap, in excerpt order | O(F) iterations
-        grow(f, lines, min(_file_cap(f, per_file), len(lines)))  # O(per_file)
+        grow(f, lines, min(_file_cap(f, per_file, len(lines)), len(lines)))  # O(per_file)
     return take  # O(1)
 
 
@@ -1942,7 +1968,7 @@ def render_excerpts(changed: list[str], diffs: list[tuple[str, list[str]]], per_
                 continue  # O(1)
             out.append(f"### {f}\n```diff\n" + "\n".join(lines[:n]) + "\n```")  # O(n)
             if n < len(lines):  # O(1)
-                why = "per-file" if n == _file_cap(f, per_file) else "size"  # O(1)
+                why = "per-file" if n == _file_cap(f, per_file, len(lines)) else "size"  # O(1)
                 out.append(f"(truncated: {n} of {len(lines)} diff lines shown, {why} cap)")  # O(1)
         skipped = [f for f in changed if not take.get(f)]  # O(F)
         if skipped:  # O(1)
@@ -2075,6 +2101,7 @@ def _full_ran(summary: dict) -> bool:  # O(F) total
     """A full run that ran tests: a crash (an `error` key; older summaries: a bare error line without `::`) decides nothing."""
     fails = summary.get("failures") or []  # O(1)
     return (summary.get("mode") == "full" and not summary.get("error") and isinstance(fails, list)  # O(1)
+            and not summary.get("recorded")  # a recorded run (run_tests --record) never closes incidents | O(1)
             and all("::" in str(f) for f in fails)  # O(F)
             and any(isinstance(summary.get(k), int) and summary[k] > 0 for k in ("passed", "failed", "skipped")))  # O(1)
 
@@ -2131,7 +2158,7 @@ def render_item(root: Path, it: Item, shown: set[tuple[str, int]], idx: str) -> 
     out = [f"### {idx} {it.title}"] + ([f"checker: {it.checker}"] if it.checker else [])  # O(1)
     if it.body:  # O(1)
         out.append(it.body)  # O(1)
-    if it.file:  # O(1)
+    if it.file and it.file != "-":  # "-" means no file | O(1)
         key = (it.file, it.line)  # O(1)
         if key in shown:  # O(1)
             out.append("(excerpt shown with the item for the same location)")  # O(1)

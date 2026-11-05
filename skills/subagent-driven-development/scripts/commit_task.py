@@ -395,6 +395,18 @@ def changed_vs_parent(files):  # O(m) + 2 git spawns, batched
     return [f for f in files if (f in have if f in gone else f not in now or have.get(f) != now[f])]  # O(m) unreadable hash = changed
 
 
+def deleted_owned(owns, live, plan):  # O(e*f + m) + 2 git spawns; checkpoint mode only
+    """Files this plan's checkpoints hold that this task owns and that are gone from disk and from git status."""
+    if autocommit.is_on():  # O(1)
+        return []  # O(1)
+    st = autocommit.load_state()  # O(1) file read
+    if not st or autocommit.plan_key(st.get("plan")) != autocommit.plan_key(plan):  # same plan only | O(len)
+        return []  # O(1)
+    seen = {f for e in st.get("entries", []) for f in e.get("files", [])}  # O(e*f)
+    gone = [f for f in sorted(seen) if f not in live and not os.path.lexists(f) and nt.owns_match(f, owns)]  # O(f) stat
+    return changed_vs_parent(gone) if gone else []  # O(m) + process spawns
+
+
 def resolve_blocked(log, tid, files):  # O(log size) read + one append
     """Files this commit takes in that an earlier run blocked get a resolved entry at the same location."""
     newest = {}  # file -> newest entry | O(1)
@@ -472,6 +484,7 @@ def commit_one(a, tid, info, own_files):  # O(m*o + py size) + git spawns (statu
     live = {f for f, _ in entries}  # O(m)
     also = [_rel(f).rstrip("/") for f in (getattr(a, "also", None) or [])]  # O(k)
     hit = lambda f, e: f == e or f.startswith(e + "/")  # file, or file under a directory entry | O(len f)
+    ruled = {e.replace("\\", "/").rstrip("/"): t for e, t in {**also_owned(a.ledger), **getattr(a, "claims", {})}.items()}  # ledger rulings and claims | O(c)
     named = {}  # entry -> name as given (directory entries keep the user's text) | O(1)
     for raw in (getattr(a, "also", None) or []):  # O(k) iterations
         named[_rel(raw).rstrip("/")] = raw if raw.replace("\\", "/").endswith("/") else _rel(raw)  # O(1)
@@ -494,6 +507,10 @@ def commit_one(a, tid, info, own_files):  # O(m*o + py size) + git spawns (statu
         if nt.owns_match(f, owns):  # O(f)
             mine.append(f)  # O(1)
         elif nt.owns_match(f, other):  # O(o)
+            for e, t2 in ruled.items():  # a ruling or claim made it theirs: say so | O(r)
+                if t2 != tid and hit(f, e):  # O(len f)
+                    print(f"left uncommitted (claimed by {t2}): {f}", file=sys.stderr)  # O(1)
+                    break  # O(1)
             continue  # another task's file, built in parallel in this tree: leave it alone | O(1)
         elif tid != "T0" and shared_test(f, code):  # a fixer's edit to a shared test joins this task | O(len path)
             cand.append(f)  # O(1)
@@ -505,6 +522,7 @@ def commit_one(a, tid, info, own_files):  # O(m*o + py size) + git spawns (statu
     if out_of_scope and not autocommit.is_on():  # a file already in the parent checkpoint (an earlier --also) is no new change | O(1)
         keep = set(changed_vs_parent(out_of_scope))  # O(m) + process spawns
         out_of_scope = [f for f in out_of_scope if f in keep]  # O(m)
+    mine += deleted_owned(owns, live, a.plan)  # an owned file only the checkpoints hold, deleted since | O(e*f) + process spawns
     if cand:  # a shared test already in the parent checkpoint is not this task's change | O(1)
         shared = changed_vs_parent(cand)  # O(m) + process spawns
         mine += shared  # O(m)
@@ -580,15 +598,24 @@ def main(argv=None):  # O(L + t*(m*o)) + git spawns per task; one process for al
     ap.add_argument("--cap", type=int, default=10, help="cap for --dispatch")  # O(1)
     ap.add_argument("--also", action="extend", nargs="+", default=[], metavar="FILE",  # O(1)
                     help="commit FILE with the one named task even if another task owns it or nobody does")  # O(1)
-    ap.add_argument("--ruling", help="why --also is needed; written to the ledger")  # O(1)
+    ap.add_argument("--claim", action="extend", nargs="+", default=[], metavar="FILE",  # O(1)
+                    help="record that the one named task also commits FILE (needs --ruling); commits nothing")  # O(1)
+    ap.add_argument("--ruling", help="why --also or --claim is needed; written to the ledger")  # O(1)
     a = ap.parse_args(argv)  # O(1)
-    ids = [x for x in a.also if re.fullmatch(r"T\d+", x) and not os.path.exists(x)]  # `--also F T1`: the greedy flag took the task id | O(k)
+    ids = [x for x in a.also + a.claim if re.fullmatch(r"T\d+", x) and not os.path.exists(x)]  # `--also F T1`: the greedy flag took the task id | O(k)
     a.also = [x for x in a.also if x not in ids]  # O(k)
+    a.claim = [x for x in a.claim if x not in ids]  # `--claim F T1` too | O(k)
     a.task = a.task + ids  # O(k)
     if not a.task:  # O(1)
         ap.error("the following arguments are required: task")  # O(1)
     if a.also and not a.ruling:  # O(1)
         nt.die("--also needs --ruling TEXT")  # O(1)
+    if a.claim and not a.ruling:  # O(1)
+        nt.die("--claim needs --ruling TEXT")  # O(1)
+    if a.claim and a.also:  # O(1)
+        nt.die("--claim and --also cannot be combined")  # O(1)
+    if a.claim and len(a.task) != 1:  # O(1)
+        nt.die("--claim takes exactly one task")  # O(1)
 
     info = nt.parse_plan(a.plan)  # O(L) parse plan, once for every task
     if "T0" not in info:  # a Wave 0 task synthesized by `wave0` | O(1)
@@ -597,6 +624,21 @@ def main(argv=None):  # O(L + t*(m*o)) + git spawns per task; one process for al
         if w0:  # O(1)
             info["T0"] = {"id": "T0", "title": w0["title"], "owns": w0["owns"], "body": ""}  # O(1)
     add_also_owns(info, a.ledger)  # O(c + o) --also files stay owned by their task
+    if a.claim:  # a claim only records the ruling: nothing is committed | O(k)
+        if a.task[0] not in info:  # O(1)
+            nt.die(f"unknown task {a.task[0]}")  # O(1)
+        for raw in a.claim:  # O(k) iterations
+            name = raw if raw.replace("\\", "/").endswith("/") else _rel(raw)  # O(1)
+            append_ledger(a.ledger, f"- Ruling: {a.task[0]} also commits {name} - {a.ruling}")  # O(1) file I/O
+            print(f"{a.task[0]} claimed {name}")  # O(1)
+        return 0  # O(1)
+    a.claims = {}  # entry -> task for this call's --also, known to every task in the call | O(1)
+    if a.also and a.task[0] in info:  # O(k)
+        for raw in a.also:  # O(k) iterations
+            e = _rel(raw).rstrip("/")  # O(1)
+            a.claims[e] = a.task[0]  # O(1)
+            if e not in info[a.task[0]]["owns"]:  # O(o)
+                info[a.task[0]]["owns"] = info[a.task[0]]["owns"] + [e]  # O(o)
     unknown = [t for t in a.task if t not in info]  # O(t)
     if len(a.task) == 1 and unknown:  # O(1)
         nt.die(f"unknown task {unknown[0]}")  # O(1)

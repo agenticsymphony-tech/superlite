@@ -3,6 +3,7 @@
 
     run_tests.py [--fast PATHS... | --full] [--log PATH] [--ledger PATH]
                  [--summary PATH] [--background]
+    run_tests.py --record --passed N [--failed N] [--skipped N] [--seconds S] --command CMD   (a full result run outside run_tests; report only, closes no incidents)
     run_tests.py [--timeout S] [--summary PATH] --wait [PATH]
 
 Prints `passed failed skipped seconds` (errors count as failed). Each failing
@@ -313,6 +314,12 @@ def main(argv=None):  # O(X + T*d + B + F log F) + pytest run + one incident app
     ap.add_argument("--timeout", type=float, default=None, help=f"--wait limit in seconds (default {DEFAULT_WAIT:.0f})")  # O(1)
     ap.add_argument("--task", default=None, help="task id: compiled stacks run in .superlite/trees/<task> (own files only)")  # O(1)
     ap.add_argument("--plan", default=None, help=f"plan for --task Owns (default: the plan in .superlite/stable.json, else {nt.DEFAULT_PLAN})")  # O(1)
+    ap.add_argument("--record", action="store_true", help="record a result run outside run_tests (needs --passed and --command), no test run")  # O(1)
+    ap.add_argument("--passed", type=int, default=None, help="--record: tests that passed")  # O(1)
+    ap.add_argument("--failed", type=int, default=0, help="--record: tests that failed (default 0)")  # O(1)
+    ap.add_argument("--skipped", type=int, default=0, help="--record: tests that were skipped (default 0)")  # O(1)
+    ap.add_argument("--seconds", type=float, default=0.0, help="--record: run time in seconds (default 0)")  # O(1)
+    ap.add_argument("--command", default=None, help="--record: the command that ran them")  # O(1)
     ap.add_argument("--run-id", default=None, help=argparse.SUPPRESS)  # O(1) set by --background
     ap.add_argument("--publish", default=None, help=argparse.SUPPRESS)  # O(1) set by --background
     argv = list(sys.argv[1:] if argv is None else argv)  # O(len argv)
@@ -322,6 +329,8 @@ def main(argv=None):  # O(X + T*d + B + F log F) + pytest run + one incident app
     root = project_root(cwd) if a.wait_path is None else None  # --wait paths are absolute | O(d)
     if root is not None and root != cwd:  # O(1)
         to_root(a, argv, cwd, root)  # O(len argv + p)
+    if a.record:  # O(1)
+        return record_run(a)  # O(1)
     if a.wait_path is not None:  # O(1)
         return wait_background(a)  # O(timeout / POLL_SECONDS)
     if a.background:  # O(1)
@@ -337,6 +346,25 @@ def main(argv=None):  # O(X + T*d + B + F log F) + pytest run + one incident app
                 publish_summary(a)  # O(summary size)
             raise  # O(1)
     return run(a)  # see run
+
+
+def record_run(a):  # a full result the agent ran outside run_tests: reports only, closes no incidents | O(1)
+    for flag, val in (("--passed", a.passed), ("--command", a.command)):  # O(1)
+        if val is None or val == "":  # O(1)
+            print(f"run_tests: --record needs {flag}", file=sys.stderr)  # O(1)
+            return 2  # O(1)
+    for flag, val in (("--passed", a.passed), ("--failed", a.failed), ("--skipped", a.skipped), ("--seconds", a.seconds)):  # O(1)
+        if val < 0:  # O(1)
+            print(f"run_tests: {flag} must be >= 0", file=sys.stderr)  # O(1)
+            return 2  # O(1)
+    write_summary(a.summary, "full", {"passed": a.passed, "failed": a.failed, "skipped": a.skipped, "skipped_tests": []}, [], a.seconds, started=a.started)  # O(1)
+    data = json.loads(Path(a.summary).read_text(encoding="utf-8"))  # O(1)
+    data["recorded"] = a.command[:200]  # O(1)
+    atomic_write(a.summary, json.dumps(data, ensure_ascii=False, indent=1) + "\n")  # O(1)
+    pointer_path(a.summary).unlink(missing_ok=True)  # an older background run must not shadow the recorded result | O(1)
+    ct.append_ledger(a.ledger, f"- tests full passed={a.passed} failed={a.failed} skipped={a.skipped} seconds={round(a.seconds, 1):g} recorded")  # O(1)
+    print(f"{a.passed} {a.failed} {a.skipped} {a.seconds:.1f}")  # O(1)
+    return 0  # O(1)
 
 
 def root_superlite(s, root, raw=False):  # O(len s) a tree has no .superlite/ (git-ignored): point its word-initial uses at the project root
@@ -386,9 +414,15 @@ def run_other(a, spec, paths, label, cwd=None):  # one runner command (any langu
             p = testcmd.parse_output(strip_ansi(text), r.returncode)  # O(o)
             counts = {"passed": p["passed"], "failed": p["failed"], "skipped": p["skipped"], "skipped_tests": []}  # O(1)
             last = next((ln for ln in reversed(p["tail"]) if ln.strip()), "no output")  # O(1)
-            failures = [("-", 0, f"{n}: failed") for n in p["names"]] or ([("-", 0, f"exit code {r.returncode}: {last}"[:160])] if r.returncode else [])  # O(k)
+            failures = [("-", 0, f"{n}: failed") for n in p["names"]]  # O(k)
+            if r.returncode and not failures:  # a red exit with no names: name the command | O(1)
+                failures = [("-", 0, f"exit code {r.returncode} from `{spec['command']}`: {last}"[:200])]  # O(1)
+            if r.returncode and p["error"]:  # a compile error leads the failures | O(1)
+                failures.insert(0, ("-", 0, f"build error: {p['error']}"[:160]))  # O(1)
             files = {}  # O(1)
-            atomic_write(Path(a.summary).with_name("test-output.log"), "\n".join(p["tail"]) + "\n")  # the last 40 lines | O(40)
+            tail_set = {x.strip() for x in p["tail"]}  # O(40)
+            kept = [x for x in (p["error"] if r.returncode else "", p["marker"]) if x and x not in tail_set]  # the error and marker may sit above the last 40 lines | O(40)
+            atomic_write(Path(a.summary).with_name("test-output.log"), "\n".join([*kept, *p["tail"]]) + "\n")  # O(40)
     return finish_run(a, label, counts, failures, files, seconds, r.returncode)  # O(k + F)
 
 

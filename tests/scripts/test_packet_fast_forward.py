@@ -152,4 +152,145 @@ def test_packet_lists_moved_files_once(ff_shared, pt_review, monkeypatch):
     monkeypatch.setattr(pt_review.subprocess, "run", spy)
     assert pt_review.main(["packet", "--plan", "plan.md", "--root", str(repo), "--base", "HEAD",
                            "--wait-timeout", "0"]) == 0
-    assert sum(c[-4:] == ["diff", "--name-only", start, "HEAD"] for c in calls) == 1
+    assert sum(c[-5:] == ["diff", "--name-only", "-z", start, "HEAD"] for c in calls) == 1
+
+
+def fast_forward(repo, tmp_path, files):
+    """Fast-forward repo's HEAD over a commit that writes `files` ({path: text}) on a side branch."""
+    git(repo, "branch", "-f", "social", "HEAD")
+    side = tmp_path / "social"
+    if not side.exists():
+        git(repo, "worktree", "add", "-q", str(side), "social")
+    for rel, text in files.items():
+        write(side, rel, text)
+    git(side, "add", "-A")
+    git(side, "commit", "-q", "-m", "social")
+    git(repo, "merge", "-q", "--ff-only", "social")
+
+
+def packet_for(repo, base):
+    r = run("pt_review", "packet", "--plan", "plan.md", "--root", str(repo), "--base", base,
+            "--wait-timeout", "0", cwd=repo)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return (repo / ".superlite" / "review-packet.md").read_text(encoding="utf-8")
+
+
+def test_ff_glob_owns_post_merge_checkpoint(tmp_path, pt_review):
+    """#158: T4 owns the directory docs/; a fast-forward adds docs/merged.md before its checkpoint."""
+    repo = make_repo(tmp_path)
+    old = git(repo, "rev-parse", "HEAD")
+    write(repo, "src/a.py", "def parse(t):\n    return t.split()\n")
+    assert checkpoint(repo, "T1").returncode == 0
+    fast_forward(repo, tmp_path, {"docs/merged.md": "merged\n"})
+    write(repo, "docs/mine.md", "mine\n")
+    r = checkpoint(repo, "T4")
+    assert r.returncode == 0, r.stdout + r.stderr
+    new = git(repo, "rev-parse", "HEAD")
+    assert new != old
+    changed, diffs = pt_review.changed_diffs(repo, new, [])
+    assert "docs/merged.md" not in changed and "docs/mine.md" in changed
+    assert "docs/merged.md" not in pt_review.git_diff_stat(repo, new)
+    assert "docs/merged.md" not in packet_for(repo, new)
+
+
+def test_ff_merged_file_checkpointed_before_merge(tmp_path, pt_review):
+    """#158: the run checkpoints src/b.py, then a fast-forward changes lines of it the run did not touch."""
+    repo = make_repo(tmp_path)
+    write(repo, "src/b.py", "def lex(t):\n    return list(t)\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "b")
+    write(repo, "src/b.py", "def lex(t):\n    return list(t)\n\n\nRUN_LINE = 2\n")
+    assert checkpoint(repo, "T2").returncode == 0
+    git(repo, "checkout", "-q", "--", "src/b.py")  # git refuses a fast-forward over a dirty tracked file
+    fast_forward(repo, tmp_path, {"src/b.py": "MERGED = 1\n\n\ndef lex(t):\n    return list(t)\n"})
+    new = git(repo, "rev-parse", "HEAD")
+    changed, diffs = pt_review.changed_diffs(repo, new, [])
+    assert changed == ["src/b.py"]
+    lines = dict(diffs)["src/b.py"]
+    assert "+RUN_LINE = 2" in lines and "+MERGED = 1" not in lines
+    assert not any(ln.startswith("-") and not ln.startswith("---") for ln in lines)
+    packet = packet_for(repo, new)
+    assert "+MERGED = 1" not in packet
+
+
+def test_ff_non_ascii_file_checkpointed_before_merge(tmp_path, pt_review):
+    """#158: a path git quotes in numstat (non-ASCII, space) still picks the run range for a merged file."""
+    repo = make_repo(tmp_path)
+    name = "docs/\u00e4 b.md"
+    write(repo, name, "def lex(t):\n    return list(t)\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "b")
+    write(repo, name, "def lex(t):\n    return list(t)\n\n\nRUN_LINE = 2\n")
+    assert checkpoint(repo, "T4").returncode == 0
+    git(repo, "checkout", "-q", "--", name)
+    fast_forward(repo, tmp_path, {name: "MERGED = 1\n\n\ndef lex(t):\n    return list(t)\n"})
+    new = git(repo, "rev-parse", "HEAD")
+    changed, diffs = pt_review.changed_diffs(repo, new, [])
+    assert changed == [name]
+    lines = dict(diffs)[name]
+    assert "+RUN_LINE = 2" in lines and "+MERGED = 1" not in lines
+    assert not any(ln.startswith("-") and not ln.startswith("---") for ln in lines)
+
+
+def test_ff_explicit_sha_base(ff_repo, pt_review):
+    """#158: an explicit sha as --base gives the same files and stat as the word HEAD."""
+    repo, _ = ff_repo
+    new = git(repo, "rev-parse", "HEAD")
+    assert pt_review.git_diff_stat(repo, new) == pt_review.git_diff_stat(repo, "HEAD")
+    assert pt_review.changed_diffs(repo, new, []) == pt_review.changed_diffs(repo, "HEAD", [])
+    packet = packet_for(repo, new)
+    assert "social/feed.py" not in packet and "src/b.py" in packet
+
+
+def _shown(pt_review, repo):
+    new = git(repo, "rev-parse", "HEAD")
+    changed, diffs = pt_review.changed_diffs(repo, new, [])
+    return changed, dict(diffs)
+
+
+def test_ff_run_only_deletes_lines_checkpointed_before_merge(tmp_path, pt_review):
+    """#158: a run that only deletes lines of a file the merge then extends shows its deletions, not the merged lines."""
+    repo = make_repo(tmp_path)
+    write(repo, "src/b.py", "".join(f"L{i} = {i}\n" for i in range(10)))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "c")
+    write(repo, "src/b.py", "".join(f"L{i} = {i}\n" for i in range(2, 10)))
+    assert checkpoint(repo, "T2").returncode == 0
+    git(repo, "checkout", "-q", "--", "src/b.py")
+    fast_forward(repo, tmp_path, {"src/b.py": "".join(f"L{i} = {i}\n" for i in range(10)) + "M1 = 1\nM2 = 2\n"})
+    changed, diffs = _shown(pt_review, repo)
+    lines = diffs["src/b.py"]
+    assert "-L0 = 0" in lines and "-L1 = 1" in lines
+    assert not any("M1" in ln or "M2" in ln for ln in lines)
+
+
+def test_ff_run_only_deletes_lines_checkpointed_after_merge(tmp_path, pt_review):
+    repo = make_repo(tmp_path)
+    write(repo, "src/b.py", "".join(f"L{i} = {i}\n" for i in range(10)))
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "c")
+    fast_forward(repo, tmp_path, {"src/b.py": "".join(f"L{i} = {i}\n" for i in range(10)) + "M1 = 1\nM2 = 2\n"})
+    write(repo, "src/b.py", "".join(f"L{i} = {i}\n" for i in range(2, 10)) + "M1 = 1\nM2 = 2\n")
+    assert checkpoint(repo, "T2").returncode == 0
+    changed, diffs = _shown(pt_review, repo)
+    lines = diffs["src/b.py"]
+    assert "-L0 = 0" in lines and not any("M1" in ln for ln in lines)
+
+
+def test_ff_merge_deletes_file_run_changed(tmp_path, pt_review):
+    repo = make_repo(tmp_path)
+    write(repo, "src/b.py", "A = 1\nB = 2\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "d")
+    write(repo, "src/b.py", "A = 1\nB = 2\nRUN = 3\n")
+    assert checkpoint(repo, "T2").returncode == 0
+    git(repo, "checkout", "-q", "--", "src/b.py")
+    git(repo, "branch", "-f", "social", "HEAD")
+    side = tmp_path / "social"
+    git(repo, "worktree", "add", "-q", str(side), "social")
+    git(side, "rm", "-q", "src/b.py")
+    git(side, "commit", "-q", "-m", "rm")
+    git(repo, "merge", "-q", "--ff-only", "social")
+    changed, diffs = _shown(pt_review, repo)
+    lines = diffs.get("src/b.py", [])
+    assert "+RUN = 3" in lines and "-A = 1" not in lines
