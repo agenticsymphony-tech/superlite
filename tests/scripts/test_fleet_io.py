@@ -46,6 +46,63 @@ def test_last_assistant_text(tmp_path):
     p = tmp_path / "t.jsonl"; transcript(p, "Status: DONE\nFiles: a.py"); assert io.last_assistant_text(p) == "Status: DONE\nFiles: a.py"
     p.write_text("not json\n"); assert io.last_assistant_text(p) == ""
 
+def rec(path, *items):
+    path.write_text("".join(json.dumps(i) + "\n" for i in items), encoding="utf-8")
+
+def user(content, **kw): return {"type": "user", "message": {"role": "user", "content": content}, **kw}
+def assistant(*blocks): return {"type": "assistant", "message": {"role": "assistant", "content": [b if isinstance(b, dict) else {"type": "text", "text": b} for b in blocks]}}
+HOOK = user("Stop hook feedback:\n[command hook 1]: session-leftovers-check: this session would leave behind:\n- 1 uncommitted file", isMeta=True)
+LEFTOVERS = "> \u26a0\ufe0f **Uncommitted work. Do /commit-merge now?**"
+
+def test_report_skips_trailing_user_block(world, tmp_path, capsys):
+    io.send(world.sd, world.plan, "W1", ["T3"], "/sl/sl", "/sl"); sent = world.clock.t[0]
+    tr = tmp_path / "w1.jsonl"
+    rec(tr, user("task"), assistant({"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}), user([{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]),
+        assistant("Status: DONE\nFiles: a.py"), HOOK, assistant(LEFTOVERS))
+    assert io.report_text(tr) == "Status: DONE\nFiles: a.py"
+    (world.sd / "metrics.jsonl").write_text(json.dumps({"ev": "stop", "t": sent + 10, "agent_id": "W1", "type": "x", "transcript": str(tr), "last": LEFTOVERS}) + "\n")
+    world.fh.states = [{"sl-proj-w1": "done"}]
+    out = io.wait(world.sd, ["W1"], 5000)
+    assert out[0]["status"] == "DONE" and "W1 T3 DONE" in capsys.readouterr().out
+    assert (world.sd / "fleet" / "reports" / "T3.md").read_text() == "Status: DONE\nFiles: a.py"
+
+def test_report_falls_back_to_last_text(tmp_path):
+    tr = tmp_path / "t.jsonl"; rec(tr, user("task"), assistant("working..."), assistant("All set"))
+    assert io.report_text(tr) == "All set"
+    assert io.report_text(tmp_path / "missing.jsonl") == ""
+
+def test_report_stays_in_latest_turn(tmp_path):
+    tr = tmp_path / "t.jsonl"
+    rec(tr, user("first task"), assistant("Status: DONE"), user([{"type": "text", "text": "second task"}]), assistant("Status: BLOCKED - no tests"))
+    assert io.report_text(tr) == "Status: BLOCKED - no tests"
+    rec(tr, user("first task"), assistant("Status: DONE"), user("second task"), assistant("still working"))
+    assert io.report_text(tr) == "still working"
+
+def test_report_survives_a_broken_json_line_in_the_latest_turn(tmp_path):
+    tr = tmp_path / "t.jsonl"
+    tr.write_text(json.dumps(user("task")) + "\n" + json.dumps(assistant("Status: DONE")) + "\n{broken json\n" + json.dumps(assistant("Files: a.py")) + "\n", encoding="utf-8")
+    assert io.report_text(tr) == "Status: DONE"
+
+def test_report_empty_turn_returns_empty_and_wait_uses_last(world, tmp_path):
+    io.send(world.sd, world.plan, "W1", ["T3"], "/sl/sl", "/sl"); sent = world.clock.t[0]
+    tr = tmp_path / "w1.jsonl"; rec(tr, user("task"), assistant("Status: DONE"), user("next"), assistant({"type": "tool_use", "id": "t1", "name": "Bash", "input": {}}))
+    assert io.report_text(tr) == ""
+    (world.sd / "metrics.jsonl").write_text(json.dumps({"ev": "stop", "t": sent + 10, "agent_id": "W1", "type": "x", "transcript": str(tr), "last": "Status: BLOCKED - from last"}) + "\n")
+    world.fh.states = [{"sl-proj-w1": "done"}]
+    assert io.wait(world.sd, ["W1"], 5000)[0]["status"] == "BLOCKED"
+
+def test_verify_line_lists_test_folder_files(tmp_path):
+    plan = make_plan(tmp_path, [{"id": "T2", "owns": "scripts/test_layers.py, tests/scripts/test_test_layers.py, docs/testing.md"}, {"id": "T5", "owns": "src/a_test.go, src/a.go"}, {"id": "T6", "owns": "src/x.py, docs/x.md"}])
+    assert "`/sl/sl run_tests --fast tests/scripts/test_test_layers.py --task T2 --background`" in io.task_message(plan, ["T2"], "/sl/sl", "/sl")
+    assert "run_tests --fast src/a_test.go --task T5 --background" in io.task_message(plan, ["T5"], "/sl/sl", "/sl")
+    assert "run_tests --fast src/x.py docs/x.md --task T6 --background" in io.task_message(plan, ["T6"], "/sl/sl", "/sl")
+
+def test_verify_line_skips_fixture_data_in_test_folder(tmp_path):
+    plan = make_plan(tmp_path, [{"id": "T2", "owns": "src/h.py, tests/scripts/test_h.py, tests/scripts/fixtures/fleet/herdr"}, {"id": "T3", "owns": "src/h.py, tests/scripts/fixtures/fleet/herdr"}])
+    assert "run_tests --fast tests/scripts/test_h.py --task T2 --background" in io.task_message(plan, ["T2"], "/sl/sl", "/sl")
+    m = io.task_message(plan, ["T3"], "/sl/sl", "/sl")
+    assert "run_tests --fast src/h.py --task T3" in m and "run_tests --fast src/h.py tests/scripts/fixtures" not in m
+
 def test_send_marks_busy_and_prompts_until_working(world, capsys):
     io.send(world.sd, world.plan, "W1", ["T3"], "/sl/sl", "/sl")
     c = world.fh.calls[0]; assert c[:2] == ("prompt", "sl-proj-w1") and c[3] == ["working"] and "# Task T3" in c[2]
